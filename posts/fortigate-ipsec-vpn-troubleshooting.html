@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FortiGate IPSec VPN Tunnel Drops — RCA &amp; Fix · SysOps Notes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;sysops.notes<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-network">Network</span>
+      <span class="post-date">2026-07-01</span>
+      <span class="post-read-time">· 8 min read</span>
+    </div>
+    <h1>FortiGate IPSec VPN Tunnel Drops — RCA &amp; Fix</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">fortigate</span>
+      <span class="post-tag-small">ipsec</span>
+      <span class="post-tag-small">vpn</span>
+      <span class="post-tag-small">fortinet</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      Phase 1 was stable. ISAKMP handshake completed fine every time. But Phase 2 — the actual data tunnel —
+      was flapping every 3–4 hours like clockwork. Users were screaming, and <code>get vpn ipsec tunnel summary</code>
+      was showing the tunnel in <code>down</code> state right after it came back up.
+    </p>
+    <p>
+      Here's how I traced it, what was actually wrong, and what fixed it permanently.
+    </p>
+
+    <h2>Environment</h2>
+    <ul>
+      <li>FortiGate 200F running FortiOS 7.2.x on both ends</li>
+      <li>Site-to-site IPSec tunnel — HQ to branch office</li>
+      <li>Traffic: mixed TCP (RDP, SMB) + UDP (VoIP)</li>
+      <li>ISP at branch: 4G failover kicking in on primary link drops</li>
+    </ul>
+
+    <h2>Initial Investigation</h2>
+
+    <h3>Step 1 — Check Phase 2 lifetime mismatch</h3>
+    <p>
+      First thing I always check: are Phase 2 lifetimes identical on both peers?
+      A mismatch causes one side to try rekeying while the other isn't ready.
+    </p>
+
+    <div class="post-body">
+    <pre><span class="pre-label">FortiGate CLI</span>
+config vpn ipsec phase2-interface
+    edit "branch-p2"
+        get
+    next
+end
+</pre>
+    </div>
+
+    <p>
+      Both sides showed <code>keylifeseconds: 43200</code> (12h) — matched. Not the issue.
+    </p>
+
+    <h3>Step 2 — Check DPD (Dead Peer Detection) settings</h3>
+    <p>
+      DPD is the keepalive mechanism. If one peer sends DPD probes and doesn't get a reply
+      (even temporarily, due to transient packet loss), it tears down the tunnel.
+    </p>
+
+    <pre><span class="pre-label">FortiGate CLI</span>
+config vpn ipsec phase1-interface
+    edit "branch-p1"
+        show | grep dpd
+    next
+end
+</pre>
+
+    <p>Output showed:</p>
+
+    <pre>set dpd on-idle
+set dpd-retrycount 3
+set dpd-retryinterval 20
+</pre>
+
+    <div class="callout">
+      <strong>The problem:</strong> <code>on-idle</code> mode sends DPD probes only when there's no traffic.
+      But with <code>retrycount 3</code> and <code>retryinterval 20s</code>, if the branch ISP hiccupped for
+      just 60 seconds during off-hours (low traffic = idle), FortiGate would declare the peer dead and tear
+      down Phase 2. The 4G failover was taking ~90 seconds to come up — just long enough to miss all DPD retries.
+    </div>
+
+    <h3>Step 3 — Confirm with FortiAnalyzer logs</h3>
+    <p>
+      Pulled the IPSec event logs from FortiAnalyzer for the exact drop times:
+    </p>
+
+    <pre><span class="pre-label">FortiAnalyzer log filter</span>
+type=event subtype=vpn action=tunnel-down
+</pre>
+
+    <p>
+      Every drop had the reason: <code>DPD failure - peer not responding</code>.
+      Timestamp correlated exactly with branch ISP outage windows logged in the router.
+    </p>
+
+    <h2>The Fix</h2>
+
+    <h3>Option 1 — Increase DPD retry tolerance</h3>
+
+    <pre><span class="pre-label">FortiGate CLI — both peers</span>
+config vpn ipsec phase1-interface
+    edit "branch-p1"
+        set dpd on-idle
+        set dpd-retrycount 10
+        set dpd-retryinterval 30
+    next
+end
+</pre>
+
+    <p>
+      This gives the tunnel 300 seconds (5 min) to recover before DPD kills it — enough time
+      for the 4G failover to complete and traffic to resume.
+    </p>
+
+    <h3>Option 2 — Switch to on-demand DPD (preferred)</h3>
+
+    <pre><span class="pre-label">FortiGate CLI — both peers</span>
+config vpn ipsec phase1-interface
+    edit "branch-p1"
+        set dpd on-demand
+    next
+end
+</pre>
+
+    <div class="callout info">
+      <strong>on-demand</strong> only sends DPD probes when there's traffic to send but the tunnel
+      appears unresponsive. This is far less aggressive than <code>on-idle</code> for intermittent
+      link scenarios. We switched to this and the random drops stopped immediately.
+    </div>
+
+    <h2>MTU — the other culprit</h2>
+    <p>
+      After fixing DPD, we still saw occasional large-file transfer failures (SMB copies stalling at 30-40%).
+      This is almost always MTU fragmentation.
+    </p>
+    <p>
+      IPSec adds overhead: ESP header (8 bytes) + IV + padding + auth tag. On a 1500 MTU link,
+      the effective MTU inside the tunnel is around 1418 bytes. If the inner packet is larger and
+      the <code>DF</code> (Don't Fragment) bit is set, packets silently drop.
+    </p>
+
+    <pre><span class="pre-label">FortiGate — set MSS clamp</span>
+config system interface
+    edit "branch-p1"
+        set tcp-mss 1350
+    next
+end
+</pre>
+
+    <div class="callout success">
+      <strong>Result:</strong> SMB transfers stabilized. No more silent drops on large files.
+    </div>
+
+    <h2>Summary — What to Check for IPSec Drops</h2>
+    <ol>
+      <li>Phase 1 &amp; 2 lifetime mismatch → match them exactly on both peers</li>
+      <li>DPD mode and timers → use <code>on-demand</code>, increase <code>retrycount</code> for flaky links</li>
+      <li>MTU / fragmentation → set <code>tcp-mss</code> to account for IPSec overhead</li>
+      <li>NAT-T → if either peer is behind NAT, enable <code>set nattraversal enable</code></li>
+      <li>FortiAnalyzer → always pull <code>tunnel-down</code> events and correlate with ISP logs</li>
+    </ol>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Have a different IPSec issue? Drop a mail at <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a> — I'll add it to the troubleshooting tree.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
