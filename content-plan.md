@@ -1,4 +1,4 @@
-# SysOps Notes — Content Plan (pulled from 10 years at Virsec & TechTree)
+# SysOps Notes — Content Plan (pulled from 10 years across enterprise IT & cybersecurity roles)
 
 Organized by the categories already in your resume/stack. Aim for one post every 1-2 weeks;
 30 posts gets you past the point where AdSense will take you seriously.
