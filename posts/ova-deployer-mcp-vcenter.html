@@ -29,7 +29,7 @@
     <div class="post-meta" style="margin-bottom: 16px;">
       <span class="post-tag tag-vmware">VMware</span>
       <span class="post-date">2026-07-12</span>
-      <span class="post-read-time">· 8 min read</span>
+      <span class="post-read-time">· 14 min read</span>
     </div>
     <h1>Streaming OVA Deploys Straight Into vCenter — with govc, ovftool Fallback, and an MCP Server</h1>
     <div class="post-tags-list" style="margin-top: 14px;">
@@ -165,6 +165,163 @@ set -a; . ./credentials.env; set +a
       over an SSH tunnel — cheap changes that remove the "keep it on a trusted network" caveat
       entirely.
     </p>
+
+    <hr style="border: none; border-top: 1px solid var(--border-dim); margin: 48px 0;">
+
+    <h2>Deployment Runbook — Using the Web UI</h2>
+    <p>
+      The write-up above covers how the tool is built; this section is the operator-facing
+      runbook — what it actually looks like to deploy a VM through the web UI, end to end.
+    </p>
+
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/01-overview.png" alt="OVA Deployer web UI — full overview with Source Image, Destination, Review & Deploy, and Deployments panels" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">The full UI in its empty state — three form cards plus a live deployments panel.</figcaption>
+    </figure>
+
+    <h3>Before you begin</h3>
+    <ul>
+      <li>A browser reachable to the agent VM on port 8080.</li>
+      <li>The name of the OVA to deploy (ask your administrator if unsure).</li>
+      <li>A unique VM name for the new machine (letters, numbers, hyphens, underscores only).</li>
+      <li>Optionally: preferred datacenter, host, datastore, and network — leave blank to use vCenter defaults.</li>
+    </ul>
+
+    <h3>Step 1–2 — Choose the OVA and name the VM</h3>
+    <p>
+      The Source Image card is where every deployment starts. Open the OVA image dropdown and
+      pick the image matching the OS or appliance you need — the count shown is how many are
+      available. Enter a VM name (letters, numbers, hyphens, underscores only) and leave
+      <strong>Count</strong> at 1 for a single VM.
+    </p>
+    <p>
+      Leave the advanced options at their defaults unless you have a reason not to: Disk
+      <strong>Thin</strong>, Engine <strong>Auto</strong>, Power on <strong>off</strong>. Switch
+      Engine to "ovftool only" specifically for desktop-exported OVAs.
+    </p>
+    <div class="callout info">
+      <strong>Tip:</strong> setting Count &gt; 1 deploys N copies named <code>&lt;name&gt;-1</code>
+      … <code>&lt;name&gt;-N</code> sequentially. A failure on one copy doesn't stop the rest.
+    </div>
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/02-source-image-filled.png" alt="Source Image card filled in with an OVA selected, VM name entered, and default disk/engine settings" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Source Image card, filled in — OVA selected, VM name entered, defaults left as-is.</figcaption>
+    </figure>
+
+    <h3>Step 3 — Set the destination</h3>
+    <p>
+      The Destination card controls where in vCenter the VM lands. Every field here is
+      optional — blank means "use vCenter defaults":
+    </p>
+    <ul>
+      <li><strong>Datacenter</strong> — selecting one filters all the remaining dropdowns.</li>
+      <li><strong>Host</strong> — the ESXi host or cluster; leave blank to let vCenter balance automatically.</li>
+      <li><strong>Resource pool</strong> — leave blank for the default.</li>
+      <li><strong>Datastore</strong> — pick one with sufficient free space.</li>
+      <li><strong>Network</strong> — the port group / VM network for the first NIC.</li>
+    </ul>
+    <div class="callout info">
+      <strong>Tip:</strong> if your environment has only one datacenter, datastore, and
+      network, you can leave all destination fields blank and let vCenter pick the defaults.
+    </div>
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/03-destination-filled.png" alt="Destination card filled in with datacenter, host, resource pool, datastore, and network selected" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Destination card, filled in — datacenter, host, resource pool, datastore, and network all explicitly set.</figcaption>
+    </figure>
+
+    <h3>Step 4 — Review and deploy</h3>
+    <p>
+      The Review &amp; Deploy card mirrors every setting you picked so you can verify before
+      committing — greyed-out values (like "vCenter chooses") mean that field was left blank.
+      Click <strong>Deploy in background</strong>: the server responds immediately with a
+      deploy ID while the actual import runs as a detached background process. A confirmation
+      toast appears, and a new row shows up in the Deployments panel below.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/04-review-deploy.png" alt="Review and Deploy card showing the full summary grid and the Deploy in background button" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Review & Deploy — every resolved setting shown before you commit.</figcaption>
+    </figure>
+    <div class="callout success">
+      <strong>Tip:</strong> the deployment keeps running even if you close the browser tab.
+      Come back any time — the Deployments panel shows current status for every past deploy.
+    </div>
+
+    <h3>Step 5 — Monitor the deployment</h3>
+    <p>
+      The Deployments panel refreshes automatically every 4 seconds. Each row shows the VM
+      name, OVA, start time, engine used, and current status:
+    </p>
+    <ul>
+      <li><strong>queued</strong> — process started but the engine hasn't written output yet; normal for the first few seconds.</li>
+      <li><strong>running</strong> — OVA is being streamed and imported; large images take 5–30 min. Click "View log" to watch bytes move.</li>
+      <li><strong>succeeded</strong> — the VM exists in vCenter; power it on and configure as needed.</li>
+      <li><strong>failed</strong> — open the full log for the error message (see Troubleshooting below).</li>
+    </ul>
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/05-deployment-running.png" alt="Deployments panel showing a deployment in progress with a progress bar" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Deployment running — confirmation toast plus a live progress bar.</figcaption>
+    </figure>
+    <figure style="margin: 24px 0;">
+      <img src="images/ova-deployer-runbook/06-deployment-succeeded.png" alt="Deployments panel showing a succeeded deployment with the govc engine badge" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Deployment succeeded — engine used (govc) shown next to the log link.</figcaption>
+    </figure>
+    <p>
+      Click "View log" on any row to open the log drawer — it shows raw output from govc or
+      ovftool, including upload progress and any error messages.
+    </p>
+
+    <h2>Troubleshooting</h2>
+    <div style="overflow-x: auto;">
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem; border-collapse: collapse;">
+      <tr><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Symptom</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Likely cause</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Resolution</th></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">OVA list is empty</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Agent cannot reach the OVA web server.</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Check network connectivity from the agent VM. Contact your administrator.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Destination dropdowns empty or show errors</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Agent cannot reach vCenter (credentials or network).</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Contact administrator to verify GOVC_URL / credentials are set correctly.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">"Invalid configuration for device N"</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">govc rejected a desktop-exported OVA (Workstation/Fusion).</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Set Engine to "ovftool only" and redeploy. In Auto mode this fallback happens automatically if ovftool is installed.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">"x509: certificate signed by unknown authority"</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">vCenter uses a self-signed certificate.</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Administrator must set GOVC_INSECURE=true in the agent config.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Network not found / NIC error</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Network name mismatch between UI and vCenter.</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Verify the Network dropdown shows the exact name as it appears in vCenter.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Status stuck on "running" for &gt; 30 min</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Large OVA or slow network. Also possible: process died silently.</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Click "View log" — if bytes are still moving, it's working. If the log hasn't changed in 10+ min, contact administrator to check the agent process.</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Browser closed — where is my deploy?</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Deploy continues in background.</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Scroll to the Deployments panel when you return — all deploys persist there.</td></tr>
+      <tr><td style="padding:8px;">"ovftool not found" with engine=ovftool</td><td style="padding:8px;">ovftool binary is not installed on the agent VM.</td><td style="padding:8px;">Contact administrator to install ovftool to bin/ovftool.</td></tr>
+    </table>
+    </div>
+
+    <h2>Quick Reference</h2>
+    <h3>Deployment checklist</h3>
+    <ol>
+      <li>Open <code>http://&lt;agent-vm&gt;:8080/</code> in a browser.</li>
+      <li>Source Image card: select OVA, enter VM name, set count / disk / engine.</li>
+      <li>Destination card: choose datacenter, host, datastore, network (all optional).</li>
+      <li>Review card: verify the summary, then click Deploy in background.</li>
+      <li>Deployments panel: wait for status to change from running → succeeded.</li>
+      <li>Log in to vCenter and confirm the VM appears in the expected folder.</li>
+      <li>Power on the VM if "Power on after deploy" wasn't checked.</li>
+    </ol>
+
+    <h3>REST API (command-line access)</h3>
+    <p>The same data visible in the UI is also available as JSON for scripting:</p>
+    <pre><span class="pre-label">bash</span>
+BASE=http://&lt;agent-vm&gt;:8080
+
+# List available OVAs
+curl -s $BASE/api/ovas | python3 -m json.tool
+
+# List all deployments
+curl -s $BASE/api/deployments | python3 -m json.tool
+
+# Status of one deployment
+curl -s $BASE/api/status/&lt;deploy-id&gt; | python3 -m json.tool
+
+# Full log
+curl -s $BASE/api/log/&lt;deploy-id&gt; | python3 -m json.tool
+</pre>
+
+    <h3>Deploy engines at a glance</h3>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Engine</th><th style="text-align:left;">Best for</th><th style="text-align:left;">Notes</th></tr>
+      <tr><td><strong>govc</strong></td><td>Well-formed OVAs exported from ESXi.</td><td>Fast, ships as a single binary. Default first choice.</td></tr>
+      <tr><td><strong>ovftool</strong></td><td>Desktop-exported OVAs (Workstation / Fusion).</td><td>Handles virtual hardware govc cannot translate.</td></tr>
+      <tr><td><strong>auto</strong></td><td>Any OVA — recommended setting.</td><td>Tries govc first; falls back to ovftool on failure.</td></tr>
+    </table>
 
     <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
       Full source, architecture diagrams, and the operations runbook are on
