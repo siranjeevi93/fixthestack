@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Building a Zero-Database Website Uptime Monitor — with an MCP Server Built In · SysOps Notes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;sysops.notes<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-itsm">ITSM</span>
+      <span class="post-date">2026-07-12</span>
+      <span class="post-read-time">· 7 min read</span>
+    </div>
+    <h1>Building a Zero-Database Website Uptime Monitor — with an MCP Server Built In</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">mcp</span>
+      <span class="post-tag-small">python</span>
+      <span class="post-tag-small">monitoring</span>
+      <span class="post-tag-small">uptime</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      I wanted a way to keep an eye on a handful of internal and external sites — some behind
+      self-signed certs, one or two with no DNS record at all — without standing up a database,
+      a message broker, or paying for a SaaS uptime monitor. So I built
+      <a href="https://github.com/siranjeevi93/website_checker" target="_blank" rel="noopener">Website Checker</a>:
+      a pure-Python monitor with three faces — an MCP server, an hourly cron checker, and a web dashboard —
+      all sharing the same flat-file state.
+    </p>
+
+    <h2>Why no database</h2>
+    <p>
+      State is just JSON on disk: <code>sites.json</code>, <code>status.json</code>, and an
+      append-only <code>history.jsonl</code>. That sounds primitive, but it means the whole thing is
+      trivial to deploy, back up (it's just files), and reason about. There's exactly one module,
+      <code>monitor_core.py</code>, that owns the check logic and the store — every other entry point
+      calls into it instead of duplicating logic.
+    </p>
+
+    <h2>Three ways in, one source of truth</h2>
+    <ul>
+      <li><strong>MCP server</strong> (<code>server.py</code>) — add/remove sites and query results
+        from Claude Code, Claude Desktop, or any MCP client over stdio.</li>
+      <li><strong>Hourly checker</strong> (<code>monitor.py</code>) — a cron-driven sweep that
+        records uptime, latency, and status codes for every configured site.</li>
+      <li><strong>Web dashboard</strong> (<code>dashboard.py</code>) — a Flask UI on
+        <code>:8090</code> with separate Internal / External panes and live status.</li>
+    </ul>
+    <p>
+      Because all three read and write the same JSON store, the dashboard always reflects the most
+      recent sweep — no cache invalidation, no coordination layer, nothing to get out of sync.
+    </p>
+
+    <h2>The edge cases that actually mattered</h2>
+
+    <h3>Self-signed / private-CA hosts</h3>
+    <p>
+      Internal appliances (vCenter, <code>.local</code> hosts) often carry self-signed certs.
+      A hard TLS-verify would flag them as down for the wrong reason. Each site supports a
+      per-site <code>verify_tls=False</code> so cert-trust failures don't masquerade as outages.
+    </p>
+
+    <h3>Hosts with no DNS record</h3>
+    <p>
+      Some internal targets aren't in DNS at all. Rather than editing <code>/etc/hosts</code> on the
+      monitor box, a per-site <code>resolve_ip</code> option connects directly to a fixed IP while still
+      sending the real hostname in the <code>Host</code> header — so the health check exercises the
+      right vhost without touching system config.
+    </p>
+
+    <h3>Alerting without a mail relay</h3>
+    <p>
+      I didn't want to depend on Postfix or an SMTP relay just to get a down-alert email. Instead,
+      <code>alerts.py</code> delivers <strong>direct to the recipient's MX</strong> over SMTP port 25
+      with opportunistic STARTTLS. When a sweep finds sites down, it sends one consolidated alert
+      (repeated hourly while they stay down); when a site recovers, it sends a one-time recovery
+      notice. The whole feature is opt-in — it's disabled whenever <code>WM_ALERT_TO</code> is empty,
+      so the repo itself never carries real addresses.
+    </p>
+
+    <div class="callout info">
+      <strong>Health rule:</strong> a site counts as healthy when it returns HTTP <code>&lt; 400</code>
+      within the timeout (10s by default). Timeouts, connection errors, and 4xx/5xx all count as down.
+    </div>
+
+    <h2>Quick start</h2>
+    <pre><span class="pre-label">bash</span>
+git clone https://github.com/siranjeevi93/website_checker.git
+cd website_checker
+
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+# verify everything works (uses an isolated temp store)
+./venv/bin/python smoke_test.py
+
+# run a one-off sweep, then launch the dashboard
+./venv/bin/python monitor.py
+./venv/bin/python dashboard.py      # http://localhost:8090
+</pre>
+
+    <h2>MCP tools exposed</h2>
+    <p>Once registered with an MCP client, these are the tools available:</p>
+    <ul>
+      <li><code>add_site(url, name, category, verify_tls, resolve_ip)</code> — add or update a monitored site</li>
+      <li><code>remove_site(url_or_name)</code> — stop monitoring a site</li>
+      <li><code>list_sites()</code> — list everything currently configured</li>
+      <li><code>check_now(url=None)</code> — run an immediate check, one site or all</li>
+      <li><code>status(url=None)</code> — latest result per site</li>
+      <li><code>history(url=None, limit=50)</code> — recent check history</li>
+      <li><code>uptime(url=None)</code> — uptime % computed on demand from history</li>
+      <li><code>test_alert()</code> — send a test alert email to configured recipients</li>
+    </ul>
+
+    <h2>What I'd change next</h2>
+    <p>
+      <code>history.jsonl</code> auto-trims, but for a fleet larger than a few dozen sites I'd
+      eventually want something queryable — SQLite is the obvious next step without giving up the
+      "just files" simplicity. For now, at the scale I'm running it, the flat-file store is one less
+      thing to operate.
+    </p>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Full source, install docs, and the architecture diagrams are on
+      <a href="https://github.com/siranjeevi93/website_checker" target="_blank" rel="noopener">GitHub</a>.
+      Questions or ideas for it? <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
