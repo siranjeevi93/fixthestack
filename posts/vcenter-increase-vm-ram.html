@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How to Increase RAM for a VM in vCenter · SysOps Notes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;sysops.notes<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-vmware">VMware</span>
+      <span class="post-date">2026-07-12</span>
+      <span class="post-read-time">· 3 min read</span>
+    </div>
+    <h1>How to Increase RAM for a VM in vCenter</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">vmware</span>
+      <span class="post-tag-small">vcenter</span>
+      <span class="post-tag-small">vsphere</span>
+      <span class="post-tag-small">memory</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      A quick, no-drama runbook for bumping the memory allocation on a VM through the vSphere
+      Client. This requires a brief outage on the VM — memory hot-add isn't enabled by default on
+      most templates, so the safest path is a clean power-off, resize, and power-on.
+    </p>
+
+    <div class="callout info">
+      <strong>Before you start:</strong> confirm the target ESXi host/cluster has enough free
+      memory headroom for the new allocation, and schedule the brief downtime with whoever owns
+      the workload on this VM.
+    </div>
+
+    <h2>Steps</h2>
+
+    <h3>1. Log in to vCenter and navigate to the VM</h3>
+    <p>
+      Open the vSphere Client, find the VM in the inventory, and confirm it's powered off before
+      making hardware changes. The <strong>Summary</strong> tab shows current allocation —
+      in this example, 4 vCPUs and 4 GB of memory allocated.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/vcenter-increase-ram/01-vm-summary.png" alt="VM Summary tab in vCenter showing Powered Off status and current CPU/memory allocation" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">VM Summary tab — confirm the power state is Off before editing hardware.</figcaption>
+    </figure>
+
+    <h3>2. Open Actions → Edit Settings</h3>
+    <p>
+      From the toolbar (or right-click the VM), open <strong>Actions</strong> and choose
+      <strong>Edit Settings…</strong>
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/vcenter-increase-ram/04-actions-menu.png" alt="Actions button highlighted on the VM toolbar in vCenter" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Click Actions on the VM toolbar…</figcaption>
+    </figure>
+    <figure style="margin: 24px 0;">
+      <img src="images/vcenter-increase-ram/02-actions-edit-settings.png" alt="Actions dropdown menu with Edit Settings option highlighted" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">…then select Edit Settings from the dropdown.</figcaption>
+    </figure>
+
+    <h3>3. Change the Memory value</h3>
+    <p>
+      In the <strong>Virtual Hardware</strong> tab, update the <strong>Memory</strong> field to the
+      new size (and unit — MB/GB) and click <strong>OK</strong>.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/vcenter-increase-ram/03-edit-settings-memory.png" alt="Edit Settings dialog with the Memory field highlighted" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Edit Settings → Virtual Hardware — update Memory, then OK.</figcaption>
+    </figure>
+
+    <h3>4. Power the VM back on</h3>
+    <p>
+      That's it — the new memory allocation takes effect on the next boot. Power the VM on and
+      confirm the guest OS sees the updated total (e.g. <code>free -h</code> on Linux,
+      Task Manager / <code>systeminfo</code> on Windows).
+    </p>
+
+    <div class="callout success">
+      <strong>Result:</strong> RAM allocation increased with no configuration drift — same process
+      works whether you're going from 4 GB to 8 GB or resizing a much larger VM.
+    </div>
+
+    <h2>Notes</h2>
+    <ul>
+      <li>If the <strong>Memory</strong> field is greyed out, the VM is still powered on — this
+        operation isn't hot-add unless that's explicitly enabled on the VM (and supported by the
+        guest OS).</li>
+      <li>Increasing memory above the host's available capacity can trigger ballooning or swapping
+        cluster-wide — check <strong>Capacity and Usage</strong> on the host/cluster first.</li>
+      <li>For memory-hot-add-enabled VMs, the same Edit Settings change can apply without powering
+        off — but always verify hot-add is supported by the guest OS before relying on it.</li>
+    </ul>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Questions about a trickier vCenter resizing scenario? Drop a mail at
+      <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
