@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Streaming OVA Deploys Straight Into vCenter — with govc, ovftool Fallback, and an MCP Server · SysOps Notes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;sysops.notes<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-vmware">VMware</span>
+      <span class="post-date">2026-07-12</span>
+      <span class="post-read-time">· 8 min read</span>
+    </div>
+    <h1>Streaming OVA Deploys Straight Into vCenter — with govc, ovftool Fallback, and an MCP Server</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">vmware</span>
+      <span class="post-tag-small">vcenter</span>
+      <span class="post-tag-small">govc</span>
+      <span class="post-tag-small">mcp</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      Deploying an OVA into vCenter by hand — picking the datacenter, host, resource pool,
+      datastore, network, then babysitting the import — gets old fast when you're doing it
+      repeatedly. I built
+      <a href="https://github.com/siranjeevi93/ova_deployer" target="_blank" rel="noopener">OVA Deployer</a>
+      to make it one click (or one MCP tool call): pick an OVA served over HTTP, pick a
+      destination, and it streams the image straight into vCenter in the background.
+    </p>
+
+    <h2>Two front doors, one core</h2>
+    <p>
+      There's a small Flask web UI (<code>webapp.py</code> + a single-page dashboard) for a human
+      to click through, and an MCP server (<code>server.py</code>) for AI/automation clients over
+      stdio. Both call the exact same underlying functions — nothing is duplicated, and the web UI
+      works perfectly well with no AI client involved at all.
+    </p>
+    <p>
+      The OVA itself never touches local disk — it flows <strong>web server → deploy tool → vCenter</strong>
+      as a stream. No staging, no cleanup.
+    </p>
+
+    <h2>Fire-and-forget deploys</h2>
+    <p>
+      A deploy call returns a <code>deploy_id</code> immediately; the actual import runs as a
+      <strong>detached background process</strong> (<code>setsid</code> / <code>start_new_session=True</code>),
+      so it survives the HTTP request finishing, the browser closing, or the MCP/SSH session
+      ending. State is derived entirely from files on disk —
+      <code>deployments/&lt;id&gt;.json</code> (metadata), <code>.log</code> (combined output), and
+      <code>.rc</code> (exit code, written when the process finishes) — so status is correct even
+      across a restart of the web app.
+    </p>
+
+    <div class="callout info">
+      <strong>Status model:</strong> started → running → succeeded/failed, derived by checking
+      whether the background process is alive and whether an <code>.rc</code> file exists — no
+      in-memory state to lose.
+    </div>
+
+    <h2>Two deploy engines, auto-fallback between them</h2>
+    <p>
+      This is the part that actually mattered in practice. <code>govc</code> (a lightweight Go
+      vSphere CLI) is fast and needs no separate install, but it's a strict, literal OVF
+      translator. <code>ovftool</code> (VMware's official tool) is slower to set up but far more
+      lenient — it sanitizes and converts hardware definitions govc won't touch.
+    </p>
+    <p>
+      Real example from building this: a desktop-exported <code>Ubuntu24.04.ova</code> (from
+      Workstation/Fusion, not ESXi) made govc reject it with
+      <code>Invalid configuration for device 6</code> — a 3D video card with
+      <code>enableMPTSupport</code>. Stripping that device just moved the error to device 5, then
+      device 0. govc simply couldn't translate that VM's hardware for vCenter no matter what got
+      removed. <code>ovftool</code> (with <code>--allowExtraConfig</code>) imported it cleanly on
+      the first try.
+    </p>
+    <p>
+      So <code>deploy_ova(engine="auto")</code> (the default) tries govc first — fast path for
+      well-formed, ESXi-exported OVAs — and falls back to ovftool automatically when govc fails.
+      The operator never has to know or care which kind of OVA they're holding.
+    </p>
+
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th></th><th>govc</th><th>ovftool</th></tr>
+      <tr><td>What it is</td><td>Lightweight Go vSphere CLI (govmomi)</td><td>VMware's official OVF Tool</td></tr>
+      <tr><td>OVF handling</td><td>Strict, literal translation</td><td>Smart, lenient — sanitizes/converts</td></tr>
+      <tr><td>Install</td><td>Single binary, no account needed</td><td>Requires a Broadcom account download</td></tr>
+      <tr><td>Best for</td><td>Well-formed (ESXi-exported) OVAs — fast</td><td>Desktop-exported (Workstation/Fusion) OVAs</td></tr>
+    </table>
+
+    <h2>Credentials handling</h2>
+    <p>
+      vCenter credentials live only in a gitignored, mode-600 <code>credentials.env</code>, loaded
+      into the process environment at launch and read by <code>govc</code> directly. The one
+      caveat: <code>ovftool</code> takes the password inside its <code>vi://user:pass@host</code>
+      target URL, so it's briefly visible in <code>ps</code> output during a deploy — that's
+      documented rather than hidden, and acceptable on a trusted network. Anything written to
+      deploy metadata or logs has the command sanitized (<code>vi://user:***@host</code>) so the
+      password never lands on disk.
+    </p>
+
+    <div class="callout success">
+      <strong>No auth on the web UI, by design:</strong> it's meant for a trusted internal network
+      only — it can create VMs, so don't expose it beyond that without adding auth in front of it.
+    </div>
+
+    <h2>Tools exposed (same set, web and MCP)</h2>
+    <ul>
+      <li><code>list_ovas()</code> — list <code>.ova</code> files available on the web server</li>
+      <li><code>vcenter_about()</code> — verify vCenter connectivity</li>
+      <li><code>list_vcenter_targets()</code> — datacenters, clusters/hosts, datastores, networks</li>
+      <li><code>deployment_spec(ova)</code> — inspect an OVA's networks/properties before deploying</li>
+      <li><code>deploy_ova(ova, vm_name, ...)</code> — start a background deployment</li>
+      <li><code>deployment_status(deploy_id)</code> — running / succeeded / failed + log tail</li>
+      <li><code>deployment_log(deploy_id)</code> — full deploy log</li>
+      <li><code>list_deployments()</code> — everything currently tracked</li>
+    </ul>
+
+    <h2>Quick start</h2>
+    <pre><span class="pre-label">bash</span>
+cd ova-deploy-mcp
+cp credentials.env.example credentials.env    # fill in vCenter creds
+set -a; . ./credentials.env; set +a
+./venv/bin/python smoke_test.py               # webserver + vCenter sanity checks
+
+# web UI
+./venv/bin/python webapp.py                   # http://&lt;host&gt;:8080/
+
+# or MCP server (stdio)
+./venv/bin/python server.py
+</pre>
+
+    <p>
+      Persistence on the deploy host is handled with a <code>start-webapp.sh</code> script wired
+      into the user's crontab: <code>@reboot</code> to start on boot, plus a
+      <code>*/2 * * * *</code> watchdog line to relaunch it if the process ever dies.
+    </p>
+
+    <h2>What I'd tighten next</h2>
+    <p>
+      The web UI's total lack of auth is fine on a locked-down network segment, but the obvious
+      next step is fronting it with basic auth or binding it to localhost-only and reaching it
+      over an SSH tunnel — cheap changes that remove the "keep it on a trusted network" caveat
+      entirely.
+    </p>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Full source, architecture diagrams, and the operations runbook are on
+      <a href="https://github.com/siranjeevi93/ova_deployer" target="_blank" rel="noopener">GitHub</a>.
+      Questions? <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
