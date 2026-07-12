@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How to Increase a Linux Partition — LVM on VMware, Step by Step · SysOps Notes</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;sysops.notes<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-vmware">VMware</span>
+      <span class="post-date">2026-07-12</span>
+      <span class="post-read-time">· 9 min read</span>
+    </div>
+    <h1>How to Increase a Linux Partition — LVM on VMware, Step by Step</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">vmware</span>
+      <span class="post-tag-small">lvm</span>
+      <span class="post-tag-small">rhel</span>
+      <span class="post-tag-small">linux</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      A walkthrough for extending a Linux LVM partition end-to-end: adding a new virtual disk in
+      VMware, turning it into a physical volume, extending the volume group, and growing the
+      logical volume and filesystem — all online, with no reboot and no unmounting.
+    </p>
+    <p>
+      Example environment: a RHEL 7 VM on VMware. The target is <code>/var</code> (logical volume
+      <code>rhel-var</code>), starting at 9.8 GB and growing to ~59 GB.
+    </p>
+
+    <div class="callout info">
+      <strong>Why this approach:</strong> when the existing disk has no free space left to give,
+      the cleanest path is adding a brand-new virtual disk to the VM rather than resizing an
+      existing one — no snapshot juggling, no downtime for the running workload.
+    </div>
+
+    <h2>Step 1 — Identify the partition to increase</h2>
+    <p>
+      Check current usage with <code>df -hT</code> before touching anything, to confirm which
+      partition actually needs the space.
+    </p>
+    <pre><span class="pre-label">$</span> df -hT</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/01-df-ht-identify-partition.png" alt="df -hT output highlighting /dev/mapper/rhel-var as the target partition" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">/dev/mapper/rhel-var — 9.8 GB total, 8.6 GB available (7% used), mounted at /var.</figcaption>
+    </figure>
+
+    <h2>Step 2 — Review the current partition table</h2>
+    <p>
+      Escalate to root and run <code>fdisk -l</code> to see how the primary disk is laid out
+      before adding a new one.
+    </p>
+    <pre><span class="pre-label">$</span> sudo -s
+$ fdisk -l</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/02-fdisk-l-review-table.png" alt="fdisk -l output showing the existing partitions on /dev/sda" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">/dev/sda is 107.4 GB, split into sda1 (Linux), sda2 (boot), sda3 (Linux LVM) — confirms LVM is in use.</figcaption>
+    </figure>
+
+    <h2>Step 3 — Add a new virtual hard disk in VMware</h2>
+    <p>
+      With no free space left on the existing disk, attach a new virtual disk to the VM. Open
+      <strong>Edit Settings</strong> on the VM, then click <strong>Add...</strong> to open the Add
+      Hardware wizard.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/03-vmware-add-hardware.png" alt="VMware Virtual Machine Properties — Hardware tab with Add button" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Hardware tab — click Add... to attach new hardware.</figcaption>
+    </figure>
+
+    <h2>Step 4 — Select Hard Disk as the device type</h2>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/04-select-hard-disk.png" alt="Add Hardware wizard with Hard Disk selected as the device type" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Device Type — choose Hard Disk, then Next.</figcaption>
+    </figure>
+
+    <h2>Step 5 — Create a new virtual disk</h2>
+    <p>
+      On the Select a Disk screen, choose <strong>Create a new virtual disk</strong>.
+    </p>
+    <div class="callout info">
+      <strong>Note:</strong> "Use an existing virtual disk" is for reattaching a previously
+      detached disk. "Raw Device Mappings" is only relevant for direct SAN access.
+    </div>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/05-create-new-virtual-disk.png" alt="Add Hardware — Select a Disk screen with Create a new virtual disk chosen" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Select a Disk — Create a new virtual disk.</figcaption>
+    </figure>
+
+    <h2>Step 6 — Configure disk size and provisioning policy</h2>
+    <p>Set the size (100 GB in this example) and choose a provisioning policy:</p>
+    <ul>
+      <li><strong>Thin Provision</strong> — space allocated on demand; good for dev/test to save datastore space.</li>
+      <li><strong>Thick Provision Lazy Zeroed</strong> — full space reserved immediately, zero-filled on first write.</li>
+      <li><strong>Thick Provision Eager Zeroed</strong> — full space reserved and zero-filled up front; best for production/SLA workloads.</li>
+    </ul>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/06-disk-size-provisioning.png" alt="Create a Disk screen with 100 GB size and Thin Provision selected" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Disk Size set to 100 GB, Thin Provision selected.</figcaption>
+    </figure>
+
+    <h2>Step 7 — Confirm and apply the new disk</h2>
+    <p>
+      Click through Advanced Options (defaults are fine), review the Ready to Complete summary,
+      then <strong>OK</strong>. The new disk attaches to the guest OS without a reboot.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/07-confirm-new-disk.png" alt="VM Properties showing New Hard Disk as 100 GB Thin Provision on SCSI 0:1" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">New Hard Disk listed on SCSI (0:1) — click OK to apply.</figcaption>
+    </figure>
+
+    <h2>Step 8 — Verify the new disk is detected by the OS</h2>
+    <pre><span class="pre-label">$</span> fdisk -l</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/08-fdisk-l-sdb-detected.png" alt="fdisk -l output showing the new /dev/sdb disk" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">/dev/sdb — new 107.4 GB disk detected, no reboot required.</figcaption>
+    </figure>
+
+    <h2>Step 9 — Launch fdisk to partition the new disk</h2>
+    <pre><span class="pre-label">$</span> fdisk /dev/sdb</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/09-fdisk-dev-sdb.png" alt="fdisk /dev/sdb interactive mode — no partition table found, as expected for a new disk" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Interactive fdisk session started — "no partition table" is expected on a blank disk.</figcaption>
+    </figure>
+
+    <h2>Step 10 — Create a new LVM partition on /dev/sdb</h2>
+    <p>Inside the fdisk session, run the sequence: create a partition spanning the whole disk, set its type to Linux LVM, verify, and write.</p>
+    <pre><span class="pre-label">$</span> n → p → [Enter] → [Enter] → [Enter]   # new primary partition, accept defaults
+$ t → 8e                                 # set type to Linux LVM
+$ p                                      # print table to verify
+$ w                                      # write and exit</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/10-fdisk-create-lvm-partition.png" alt="fdisk commands creating /dev/sdb1 as a Linux LVM partition" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">/dev/sdb1 created spanning the full disk, type 8e (Linux LVM).</figcaption>
+    </figure>
+
+    <h2>Step 11 — Inspect the current LVM state</h2>
+    <p>Before extending anything, check the existing physical volumes, volume group size, and logical volume layout.</p>
+    <pre><span class="pre-label">$</span> pvs
+$ vgs
+$ lvs</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/11-pvs-vgs-lvs-before.png" alt="pvs, vgs, and lvs output before extending the volume group" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">Only /dev/sda3 is a PV in the "rhel" VG; VG is ~99 GB with 0 free space.</figcaption>
+    </figure>
+
+    <h2>Step 12 — Create a physical volume and extend the volume group</h2>
+    <pre><span class="pre-label">$</span> pvcreate /dev/sdb1
+$ vgextend rhel /dev/sdb1
+$ vgs</pre>
+    <p>
+      <code>pvcreate</code> registers <code>/dev/sdb1</code> as an LVM physical volume;
+      <code>vgextend</code> adds it into the <code>rhel</code> volume group. After both, VSize
+      should jump to ~198.99 GB with ~100 GB free.
+    </p>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/12-pvcreate-vgextend.png" alt="pvcreate and vgextend output; VG rhel now shows 2 PVs and about 100 GB free" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">VG "rhel" extended — 2 PVs, ~198.99 GB total, ~100 GB free.</figcaption>
+    </figure>
+
+    <h2>Step 13 — Confirm the target logical volume</h2>
+    <p>Before extending, confirm the exact device path of the target LV — <code>/dev/mapper/rhel-var</code>, currently 10.7 GB.</p>
+    <pre><span class="pre-label">$</span> fdisk -l /dev/mapper/rhel-var</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/13-fdisk-l-rhel-var.png" alt="fdisk -l output confirming the current size of /dev/mapper/rhel-var" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">/dev/mapper/rhel-var — 10.7 GB, confirmed before extension.</figcaption>
+    </figure>
+
+    <h2>Step 14 — Extend the logical volume and resize the filesystem</h2>
+    <p>The final two operations — both online, no unmounting required.</p>
+    <pre><span class="pre-label">$</span> lvextend -L +50G /dev/mapper/rhel-var
+$ resize2fs /dev/mapper/rhel-var
+$ df -hT</pre>
+    <figure style="margin: 24px 0;">
+      <img src="images/linux-partition-vmware/14-lvextend-resize2fs-dfht.png" alt="lvextend and resize2fs output followed by df -hT confirming /var is now about 59 GB" style="border: 1px solid var(--border-dim); border-radius: 6px;">
+      <figcaption style="font-size: 0.8rem; color: var(--text-dim); margin-top: 8px;">LV grows from 10.00 GiB to 60.00 GiB; resize2fs extends the ext4 filesystem online; df -hT confirms /var at ~59 GB.</figcaption>
+    </figure>
+
+    <div class="callout success">
+      <strong>Result:</strong> /var grew from 9.8 GB to ~59 GB with zero downtime and zero
+      unmounting — the running workload never noticed.
+    </div>
+
+    <h2>Summary of commands</h2>
+    <pre><span class="pre-label">Full sequence</span>
+df -hT                              # identify the partition to expand
+fdisk -l                            # review existing partition table
+fdisk /dev/sdb                      # partition the new disk
+  n → p → [Enter] → [Enter] → [Enter]
+  t → 8e                            # set type to Linux LVM
+  w                                 # write and exit
+pvs / vgs / lvs                     # review LVM state
+pvcreate /dev/sdb1                  # initialize new PV
+vgextend rhel /dev/sdb1             # add PV to volume group
+lvextend -L +50G /dev/mapper/rhel-var   # extend the LV
+resize2fs /dev/mapper/rhel-var      # resize the filesystem
+df -hT                              # verify the new size
+</pre>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Hit a wrinkle with a different LVM layout or disk controller? Drop a mail at
+      <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
