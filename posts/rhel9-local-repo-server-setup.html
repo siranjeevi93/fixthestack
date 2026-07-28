@@ -277,57 +277,25 @@ dnf install --disablerepo="*" --enablerepo="local-rhel9-*" vim -y
 </pre>
 
     <h2>10. Automate the repository sync</h2>
-    <p>Create a sync script:</p>
-    <pre><span class="pre-label">bash</span>
-vi /usr/local/bin/rhel9-repo-sync.sh
-</pre>
-    <pre><span class="pre-label">bash</span>
-#!/bin/bash
-
-LOG="/var/log/rhel9-repo-sync.log"
-REPOS=(
-  "rhel-9-for-x86_64-baseos-rpms:/var/repos/rhel9/baseos"
-  "rhel-9-for-x86_64-appstream-rpms:/var/repos/rhel9/appstream"
-)
-
-echo "========================================" >> "$LOG"
-echo "Sync started: $(date)" >> "$LOG"
-
-for ENTRY in "${REPOS[@]}"; do
-  REPOID="${ENTRY%%:*}"
-  PATH_DIR="${ENTRY##*:}"
-
-  echo "[INFO] Syncing $REPOID ..." >> "$LOG"
-  dnf reposync \
-    --repoid="$REPOID" \
-    --download-path="$PATH_DIR/" \
-    --newest-only \
-    --delete >> "$LOG" 2>&1
-
-  echo "[INFO] Updating metadata for $PATH_DIR ..." >> "$LOG"
-  createrepo_c --update "$PATH_DIR/" >> "$LOG" 2>&1
-done
-
-echo "Sync completed: $(date)" >> "$LOG"
-</pre>
-    <p>Make it executable:</p>
-    <pre><span class="pre-label">bash</span>
-chmod +x /usr/local/bin/rhel9-repo-sync.sh
-</pre>
-    <p>Schedule it for every Sunday, 2:00 AM — a quiet time when clients are least likely to be pulling updates:</p>
+    <p>
+      No need for a separate script — the sync and metadata commands can go directly into
+      the cron file. Create it:
+    </p>
     <pre><span class="pre-label">bash</span>
 vi /etc/cron.d/rhel9-repo-sync
 </pre>
     <pre><span class="pre-label">cron</span>
-0 2 * * 0  root  /usr/local/bin/rhel9-repo-sync.sh
+# /etc/cron.d/rhel9-repo-sync
+0 2 * * 0  root  dnf reposync --repoid=rhel-9-for-x86_64-baseos-rpms --download-path=/var/repos/rhel9/baseos/ --newest-only --delete && createrepo_c --update /var/repos/rhel9/baseos/
+0 2 * * 0  root  dnf reposync --repoid=rhel-9-for-x86_64-appstream-rpms --download-path=/var/repos/rhel9/appstream/ --newest-only --delete && createrepo_c --update /var/repos/rhel9/appstream/
 </pre>
     <p>Verify the cron job got registered:</p>
     <pre><span class="pre-label">bash</span>
 crontab -l -u root
 </pre>
-    <p>And after the first scheduled run, check the log to confirm it actually worked:</p>
+    <p>And after the first scheduled run on Sunday, check <code>/var/log/cron</code> to confirm it actually ran:</p>
     <pre><span class="pre-label">bash</span>
-tail -f /var/log/rhel9-repo-sync.log
+grep reposync /var/log/cron
 </pre>
 
     <h2>11. Verification and troubleshooting</h2>
