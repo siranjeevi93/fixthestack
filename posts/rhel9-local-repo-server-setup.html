@@ -277,10 +277,7 @@ dnf install --disablerepo="*" --enablerepo="local-rhel9-*" vim -y
 </pre>
 
     <h2>10. Automate the repository sync</h2>
-    <p>
-      Doing the sync manually every time is not sustainable — better to script it and put
-      it on cron. Create the script:
-    </p>
+    <p>Create a sync script:</p>
     <pre><span class="pre-label">bash</span>
 vi /usr/local/bin/rhel9-repo-sync.sh
 </pre>
