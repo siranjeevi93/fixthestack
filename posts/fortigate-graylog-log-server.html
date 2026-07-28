@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Building a Centralized Log Server for FortiGate — Graylog, Field Parsing, and a Live Security Dashboard · FixTheStack</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;fixthestack<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-security">Security</span>
+      <span class="post-date">2026-07-28</span>
+      <span class="post-read-time">· 13 min read</span>
+    </div>
+    <h1>Building a Centralized Log Server for FortiGate — Graylog, Field Parsing, and a Live Security Dashboard</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">fortigate</span>
+      <span class="post-tag-small">graylog</span>
+      <span class="post-tag-small">opensearch</span>
+      <span class="post-tag-small">siem</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      A FortiGate firewall generates a huge amount of useful traffic and security data, but by
+      default that data only lives on the box itself, in a small local buffer, until it gets
+      overwritten. If you don't have FortiAnalyzer licensed, there is no easy way to search
+      last week's traffic, build a dashboard, or get alerted the moment someone starts
+      hammering your management interface with login attempts. So I built a small, self-hosted
+      log server using Graylog, OpenSearch, and MongoDB — free and open-source stack — to
+      receive FortiGate syslog, parse it into proper fields, and put a live security dashboard
+      on top of it.
+    </p>
+    <p>
+      This post is the step-by-step version of that setup: standing up the log server, pointing
+      the FortiGate at it, parsing the raw messages into searchable fields, running searches,
+      and finally building the dashboard itself.
+    </p>
+
+    <pre><span class="pre-label">architecture</span>
+FortiGate ──UDP 5140──► Graylog Raw Input ──► Pipeline (field parser) ──► OpenSearch
+                                                                            │
+                                                                     Dashboards / Search
+</pre>
+
+    <div class="callout info">
+      <strong>Note on IPs and credentials:</strong> every hostname below is written as
+      <code>fixthestack.local</code> (my log server) — substitute your own server's address.
+      Login credentials, API keys, and real source IPs from any incident are intentionally
+      left out; the queries and payloads shown are structural examples only.
+    </div>
+
+    <h2>The stack, at a glance</h2>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Component</th><th style="text-align:left;">Version</th><th style="text-align:left;">Role</th></tr>
+      <tr><td>Ubuntu Server</td><td>24.04 LTS</td><td>Host OS for the log server</td></tr>
+      <tr><td>MongoDB</td><td>8.0</td><td>Stores Graylog's own config — inputs, users, dashboards</td></tr>
+      <tr><td>OpenSearch</td><td>2.19.6</td><td>Stores and indexes the actual log messages</td></tr>
+      <tr><td>Graylog</td><td>6.2</td><td>Receives syslog, runs the parsing pipeline, serves search + dashboards</td></tr>
+    </table>
+    <p>
+      Minimum 4 GB RAM works for a lab; 8 GB+ is what I'd recommend for anything that's
+      actually going to carry production FortiGate traffic, since both OpenSearch and Graylog
+      run on the JVM and want their own heap.
+    </p>
+
+    <h2>Part 1 — Building the log server</h2>
+
+    <h3>1. System preparation</h3>
+    <pre><span class="pre-label">bash</span>
+apt-get update && apt-get upgrade -y
+apt-get install -y apt-transport-https curl gnupg2 ca-certificates wget lsb-release pwgen
+</pre>
+
+    <h3>2. Install MongoDB</h3>
+    <p>
+      Graylog 6.2 needs MongoDB 8.0 — the older 7.0 line doesn't ship a repository for
+      Ubuntu 24.04 (noble) yet.
+    </p>
+    <pre><span class="pre-label">bash</span>
+curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
+  gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] \
+  https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
+  > /etc/apt/sources.list.d/mongodb-org-8.0.list
+
+apt-get update
+apt-get install -y mongodb-org
+systemctl enable --now mongod
+</pre>
+    <p>Verify:</p>
+    <pre><span class="pre-label">bash</span>
+mongosh --eval "db.adminCommand('ping')"
+</pre>
+    <p>Expect <code>{ ok: 1 }</code> back.</p>
+
+    <h3>3. Install OpenSearch</h3>
+    <pre><span class="pre-label">bash</span>
+curl -fsSL https://artifacts.opensearch.org/publickeys/opensearch.pgp | \
+  gpg --dearmor -o /usr/share/keyrings/opensearch-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/opensearch-keyring.gpg] \
+  https://artifacts.opensearch.org/packages/2.x/apt stable main" \
+  > /etc/apt/sources.list.d/opensearch-2.x.list
+
+apt-get update
+apt-get install -y opensearch
+</pre>
+    <p>Edit <code>/etc/opensearch/opensearch.yml</code> for a single-node setup:</p>
+    <pre><span class="pre-label">yaml</span>
+cluster.name: graylog
+node.name: node-1
+path.data: /var/lib/opensearch
+path.logs: /var/log/opensearch
+network.host: 127.0.0.1
+http.port: 9200
+discovery.type: single-node
+plugins.security.disabled: true
+action.auto_create_index: false
+</pre>
+    <p>Set the JVM heap to roughly half of available RAM in <code>/etc/opensearch/jvm.options</code>:</p>
+    <pre><span class="pre-label">bash</span>
+-Xms2g
+-Xmx2g
+</pre>
+    <pre><span class="pre-label">bash</span>
+systemctl enable --now opensearch
+</pre>
+    <p>Verify:</p>
+    <pre><span class="pre-label">bash</span>
+curl -s http://127.0.0.1:9200/_cluster/health?pretty
+</pre>
+    <p>Look for <code>"status" : "green"</code> (or "yellow" — see the troubleshooting note below).</p>
+
+    <h3>4. Install Graylog</h3>
+    <pre><span class="pre-label">bash</span>
+wget -qO - https://downloads.graylog.org/repo/debian/pubkey.gpg | \
+  gpg --dearmor -o /usr/share/keyrings/graylog.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/graylog.gpg] \
+  https://downloads.graylog.org/repo/debian/stable 6/ /" \
+  > /etc/apt/sources.list.d/graylog.list
+
+apt-get update
+apt-get install -y graylog-server
+</pre>
+    <p>
+      Graylog needs two secrets in its config: a random <code>password_secret</code> used to
+      salt sessions, and a SHA-256 hash of your chosen admin password for
+      <code>root_password_sha2</code>. Generate both yourself rather than reusing anything
+      from a guide:
+    </p>
+    <pre><span class="pre-label">bash</span>
+# 96-character random secret
+pwgen -N 1 -s 96
+
+# SHA-256 hash of your chosen admin password
+echo -n "&lt;your-chosen-password&gt;" | sha256sum | cut -d' ' -f1
+</pre>
+    <p>Edit <code>/etc/graylog/server/server.conf</code>:</p>
+    <pre><span class="pre-label">ini</span>
+password_secret = &lt;output of pwgen above&gt;
+root_password_sha2 = &lt;output of the sha256sum above&gt;
+http_bind_address = 0.0.0.0:9000
+elasticsearch_hosts = http://127.0.0.1:9200
+mongodb_uri = mongodb://localhost/graylog
+</pre>
+    <pre><span class="pre-label">bash</span>
+systemctl enable --now graylog-server
+</pre>
+    <p>Give it about 60 seconds to come up, then verify:</p>
+    <pre><span class="pre-label">bash</span>
+systemctl status graylog-server
+</pre>
+    <p>
+      Log in to the web UI at <code>http://fixthestack.local:9000</code> with the admin
+      username/password you set above.
+    </p>
+
+    <h3>5. Firewall rules</h3>
+    <pre><span class="pre-label">bash</span>
+ufw allow 22/tcp    # SSH — add this BEFORE enabling UFW
+ufw allow 9000/tcp  # Graylog web UI + API
+ufw allow 5140/udp  # Syslog input for FortiGate
+ufw --force enable
+</pre>
+    <div class="callout info">
+      <strong>Careful:</strong> always allow port 22 before running <code>ufw enable</code>,
+      or you'll lock yourself out of the server over SSH.
+    </div>
+
+    <h3>6. Verify everything is up</h3>
+    <pre><span class="pre-label">bash</span>
+systemctl status mongod opensearch graylog-server
+ss -tlnup | grep -E '27017|9200|9000'
+curl -s http://127.0.0.1:9200/_cluster/health | python3 -m json.tool
+</pre>
+
+    <h2>Part 2 — Mapping the log server on FortiGate</h2>
+
+    <h3>1. Create the syslog input in Graylog</h3>
+    <p>Via the web UI:</p>
+    <ol>
+      <li>Go to <strong>System → Inputs</strong></li>
+      <li>Select <strong>Raw/Plaintext UDP</strong>, click <strong>Launch new input</strong></li>
+      <li>Title: <code>FortiGate Syslog</code>; Bind address: <code>0.0.0.0</code>; Port: <code>5140</code></li>
+      <li>Click <strong>Save</strong></li>
+    </ol>
+
+    <h3>2. Point the FortiGate at the log server</h3>
+    <p>On the FortiGate CLI:</p>
+    <pre><span class="pre-label">fortios</span>
+config log syslogd setting
+    set status enable
+    set server fixthestack.local
+    set port 5140
+    set facility local0
+    set format default
+end
+</pre>
+    <p>Verify:</p>
+    <pre><span class="pre-label">fortios</span>
+show log syslogd setting
+</pre>
+    <pre><span class="pre-label">output</span>
+config log syslogd setting
+    set status enable
+    set server "fixthestack.local"
+    set port 5140
+    set mode udp
+    set facility local0
+    set format default
+end
+</pre>
+
+    <h3>3. Confirm logs are actually arriving</h3>
+    <p>On the log server, watch the UDP port directly:</p>
+    <pre><span class="pre-label">bash</span>
+sudo tcpdump -i any -n udp port 5140 -c 10
+</pre>
+    <p>Or check from the Graylog UI: go to <strong>Search</strong>, set the time range to
+    <strong>Last 5 minutes</strong>, and click <strong>Search</strong> — FortiGate messages
+    should start showing up.</p>
+    <p>A typical raw FortiGate traffic log looks like this before parsing:</p>
+    <pre><span class="pre-label">raw</span>
+date=2026-07-28 time=09:00:00 devname="FGT-Edge01" devid="FGT60F..." logid="0000000013" type="traffic" subtype="forward" level="notice" srcip=192.0.2.100 dstip=8.8.8.8 srcport=45123 dstport=53 proto=17 action="accept" sentbyte=128 rcvdbyte=256 ...
+</pre>
+
+    <h2>Part 3 — Parsing the raw logs into fields</h2>
+    <p>
+      Right now every FortiGate log is just one long unstructured string — you can full-text
+      search it, but you can't group by source IP or sum bytes transferred. That needs a
+      <strong>Processing Pipeline</strong> that extracts each <code>key=value</code> pair into
+      its own Graylog field.
+    </p>
+    <p>
+      I built one pipeline, "FortiGate Field Parser," with one rule per field — about 34 rules
+      in total — connected to the <strong>Default</strong> stream so it runs on every incoming
+      message. A few syntax notes for Graylog's rule language (GPL), since it isn't quite
+      regular regex:
+    </p>
+    <ul>
+      <li>Use <code>[^ ]+</code> instead of <code>\S+</code> — the <code>\S</code> shorthand isn't supported</li>
+      <li>Use <code>[0-9]+</code> instead of <code>\d+</code> — same reason</li>
+      <li>Quoted values: <code>field="(?&lt;val&gt;[^"]+)"</code>; unquoted values (IPs, ports): <code>field=(?&lt;val&gt;[^ ]+)</code></li>
+      <li>Numeric fields must go through <code>to_long()</code> to be stored as a proper number in OpenSearch, not a string</li>
+    </ul>
+    <p>Two representative rules — a quoted string field, and a numeric one:</p>
+    <pre><span class="pre-label">gpl</span>
+rule "fg_action"
+when
+  contains(to_string($message.message), "action=")
+then
+  let m = regex("action=\"(?&lt;val&gt;[^\"]+)\"", to_string($message.message));
+  set_field("action", m["val"]);
+end
+</pre>
+    <pre><span class="pre-label">gpl</span>
+rule "fg_sent_byte"
+when
+  contains(to_string($message.message), "sentbyte=")
+then
+  let m = regex("sentbyte=(?&lt;val&gt;[0-9]+)", to_string($message.message));
+  set_field("sent_byte", to_long(m["val"]));
+end
+</pre>
+    <p>The full field map, extracted from the raw log:</p>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Raw field</th><th style="text-align:left;">Graylog field</th><th style="text-align:left;">Type</th></tr>
+      <tr><td><code>devname</code></td><td><code>device_name</code></td><td>string</td></tr>
+      <tr><td><code>srcip</code> / <code>dstip</code></td><td><code>srcip</code> / <code>dstip</code></td><td>string</td></tr>
+      <tr><td><code>srcport</code> / <code>dstport</code></td><td><code>srcport</code> / <code>dstport</code></td><td>string</td></tr>
+      <tr><td><code>action</code></td><td><code>action</code></td><td>string</td></tr>
+      <tr><td><code>policyname</code></td><td><code>policy_name</code></td><td>string</td></tr>
+      <tr><td><code>srccountry</code> / <code>dstcountry</code></td><td><code>src_country</code> / <code>dst_country</code></td><td>string</td></tr>
+      <tr><td><code>service</code>, <code>app</code></td><td><code>service</code>, <code>app_name</code></td><td>string</td></tr>
+      <tr><td><code>user</code></td><td><code>src_user</code></td><td>string</td></tr>
+      <tr><td><code>status</code>, <code>reason</code></td><td><code>status</code>, <code>reason</code></td><td>string</td></tr>
+      <tr><td><code>sentbyte</code> / <code>rcvdbyte</code></td><td><code>sent_byte</code> / <code>rcvd_byte</code></td><td>long (numeric)</td></tr>
+      <tr><td><code>duration</code></td><td><code>duration</code></td><td>long (numeric)</td></tr>
+    </table>
+
+    <div class="callout info">
+      <strong>Gotcha — index field type:</strong> if <code>sent_byte</code>/<code>rcvd_byte</code>
+      show up as strings in OpenSearch (breaking <code>sum()</code> widgets on the dashboard),
+      OpenSearch locked in the wrong type from the first message it ever saw for that field,
+      before <code>to_long()</code> was added to the rule. Fix: rotate the index so it starts a
+      fresh mapping —
+      <strong>System → Index Sets → Default index set → Maintenance → Rotate active write index</strong>
+      — then give it ~60 seconds for new messages to land with the correct numeric type.
+    </div>
+
+    <h3>Adding or testing a rule</h3>
+    <ol>
+      <li>Go to <strong>System → Pipelines → FortiGate Field Parser</strong>, click <strong>Edit</strong> on the stage, add the rule, click <strong>Update stage</strong></li>
+      <li>To test one without waiting for a real message: <strong>System → Pipelines → Simulator</strong>, paste a raw FortiGate line, and see exactly which fields get extracted</li>
+    </ol>
+
+    <h2>Part 4 — Checking the logs</h2>
+    <p>
+      With fields in place, the <strong>Search</strong> page becomes genuinely useful. A few
+      queries I use regularly:
+    </p>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Question</th><th style="text-align:left;">Query</th></tr>
+      <tr><td>Who's failing to log in?</td><td><code>action:login AND status:failed</code>, grouped by <code>srcip</code></td></tr>
+      <tr><td>Who's logging in successfully?</td><td><code>action:login AND status:success</code></td></tr>
+      <tr><td>What's my top traffic source?</td><td>(all messages), grouped by <code>srcip</code>, sorted by <code>sum(sent_byte)</code> desc</td></tr>
+      <tr><td>Is a given IP being blocked?</td><td><code>srcip:&lt;ip&gt; AND action:deny</code>, last 1 hour</td></tr>
+      <tr><td>What countries are connecting?</td><td>(all messages), grouped by <code>src_country</code></td></tr>
+    </table>
+    <p>
+      Click <strong>Open in Search</strong> from any dashboard widget to jump straight into the
+      full search view with that widget's query already filled in — handy for going from "this
+      number looks odd" to the individual log lines behind it.
+    </p>
+
+    <h2>Part 5 — Building the dashboard</h2>
+    <p>
+      A dashboard in Graylog is a set of <strong>Aggregation</strong> widgets, each built from a
+      query, a field to group by, and an aggregation function (count, sum, etc.), arranged on a
+      grid. Here's the widget set I ended up with, grouped by purpose:
+    </p>
+
+    <h3>Traffic &amp; volume</h3>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Widget</th><th style="text-align:left;">Type</th><th style="text-align:left;">Field</th><th style="text-align:left;">Aggregation</th></tr>
+      <tr><td>Total Events (24h)</td><td>Single Number</td><td>—</td><td>count()</td></tr>
+      <tr><td>Traffic Over Time</td><td>Line Chart</td><td>timestamp</td><td>count() per interval</td></tr>
+      <tr><td>Top Source IPs</td><td>Data Table</td><td>srcip</td><td>count(), top 10</td></tr>
+      <tr><td>Top Destination IPs</td><td>Data Table</td><td>dstip</td><td>count(), top 10</td></tr>
+      <tr><td>Top Services</td><td>Data Table</td><td>service</td><td>count(), top 10</td></tr>
+    </table>
+
+    <h3>Geography</h3>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Widget</th><th style="text-align:left;">Type</th><th style="text-align:left;">Field</th><th style="text-align:left;">Aggregation</th></tr>
+      <tr><td>Top Source Countries</td><td>Data Table</td><td>src_country</td><td>count(), top 10</td></tr>
+      <tr><td>Top Destination Countries</td><td>Data Table</td><td>dst_country</td><td>count(), top 10</td></tr>
+    </table>
+
+    <h3>Bandwidth</h3>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Widget</th><th style="text-align:left;">Type</th><th style="text-align:left;">Field</th><th style="text-align:left;">Aggregation</th></tr>
+      <tr><td>Bandwidth by Source IP</td><td>Data Table</td><td>srcip</td><td>sum(sent_byte), sum(rcvd_byte), top 10</td></tr>
+    </table>
+
+    <h3>Security — policy actions &amp; auth</h3>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Widget</th><th style="text-align:left;">Type</th><th style="text-align:left;">Query</th><th style="text-align:left;">Aggregation</th></tr>
+      <tr><td>Blocked Traffic</td><td>Single Number</td><td><code>action:deny OR action:block</code></td><td>count()</td></tr>
+      <tr><td>Accepted vs Denied</td><td>Bar Chart</td><td>(all), grouped by <code>action</code></td><td>count()</td></tr>
+      <tr><td>Login Failures (24h)</td><td>Single Number</td><td><code>action:login AND status:failed</code></td><td>count()</td></tr>
+      <tr><td>Login Events Over Time</td><td>Line Chart</td><td><code>action:login</code></td><td>count() per interval</td></tr>
+      <tr><td>Top Brute Force Source IPs</td><td>Data Table</td><td><code>action:login AND status:failed</code>, by <code>srcip</code></td><td>count(), top 10</td></tr>
+    </table>
+
+    <h3>Building a widget, step by step</h3>
+    <ol>
+      <li>Open a search with the query and time range you want (e.g. <code>action:login AND status:failed</code>, last 24 hours)</li>
+      <li>Click <strong>Create new → Aggregation</strong></li>
+      <li>Pick the visualization type — Single Number, Data Table, Line Chart, or Bar Chart</li>
+      <li>Set <strong>Row pivot</strong> to the field you want to group by (e.g. <code>srcip</code>), or leave it empty for a single number</li>
+      <li>Set the <strong>metric</strong> — count(), sum(field), etc.</li>
+      <li>Save the widget, then drag it onto your dashboard and resize/reposition as needed</li>
+    </ol>
+    <div class="callout success">
+      <strong>Tip — drilling down:</strong> clicking a row in a Data Table widget (say, an IP in
+      "Top Source IPs") filters the whole dashboard down to that value, so you can go from a
+      high-level count straight to "show me everything from this one address" in one click.
+    </div>
+    <p>
+      Default time range on mine is <strong>Last 24 hours</strong>, changeable from the clock
+      icon in the top-right of the dashboard — presets for 1 hour, 24 hours, 7 days, or a
+      custom range.
+    </p>
+
+    <h2>Bonus — alerting on brute force attempts</h2>
+    <p>
+      Once the fields exist, alerting is a natural next step rather than extra work. An Event
+      Definition watching failed logins:
+    </p>
+    <ol>
+      <li>Go to <strong>Alerts → Event Definitions → Create</strong></li>
+      <li>Condition type: <strong>Filter &amp; Aggregation</strong></li>
+      <li>Search query: <code>action:login AND status:failed</code>, grouped by <code>srcip</code></li>
+      <li>Aggregation condition: <code>count() &gt; 10</code>, time window: 5 minutes</li>
+      <li>Add a notification — email or a webhook (Slack, etc.)</li>
+    </ol>
+    <p>A couple more thresholds worth having from day one:</p>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Alert</th><th style="text-align:left;">Query</th><th style="text-align:left;">Threshold</th></tr>
+      <tr><td>Brute force</td><td><code>action:login AND status:failed</code></td><td>count &gt; 10 / 5 min</td></tr>
+      <tr><td>High outbound traffic</td><td>(all traffic)</td><td>sum(sent_byte) &gt; 1 GB / 1 hour</td></tr>
+      <tr><td>Policy violation spike</td><td><code>action:deny</code></td><td>count &gt; 1000 / 15 min</td></tr>
+    </table>
+
+    <h2>Housekeeping — retention and backup</h2>
+    <p>
+      Log volume adds up fast, so retention needs a decision, not a default. Under
+      <strong>System → Index Sets → Default index set</strong>, I set rotation to daily and
+      retention to delete indices past 30 days.
+    </p>
+    <p>Two things worth backing up regularly — pipeline rules and the dashboard definition itself:</p>
+    <pre><span class="pre-label">bash</span>
+# Pipeline rules
+curl -s -u &lt;user&gt;:&lt;password&gt; http://fixthestack.local:9000/api/system/pipelines/rule \
+  > pipeline-rules-backup-$(date +%Y%m%d).json
+
+# Dashboard
+curl -s -u &lt;user&gt;:&lt;password&gt; \
+  http://fixthestack.local:9000/api/views/&lt;dashboard-id&gt; \
+  > dashboard-backup-$(date +%Y%m%d).json
+
+# Full Graylog config (MongoDB)
+mongodump --db graylog --out /backup/graylog-$(date +%Y%m%d)/
+</pre>
+
+    <h2>Wrapping up</h2>
+    <p>
+      End to end, this gives a FortiGate a proper searchable log history and a live dashboard
+      without needing a FortiAnalyzer license — install the stack, point the firewall at it,
+      parse the raw syslog into fields, then build search-backed widgets on top. The same
+      pattern extends easily to other syslog-speaking devices; only the pipeline rules for
+      field extraction would need to change.
+    </p>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Questions on any of the steps above? Write to
+      <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
