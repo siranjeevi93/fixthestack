@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Setting Up a Local RHEL 9 Repository Server — Complete Guide · FixTheStack</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="../index.html" class="brand">
+      <span class="brand-prompt">~$</span>&nbsp;fixthestack<span class="brand-cursor"></span>
+    </a>
+    <nav class="nav">
+      <a href="../index.html">Home</a>
+      <a href="../about.html">About</a>
+      <a href="mailto:vsiranjeevi93@gmail.com">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="container">
+  <div class="post-header">
+    <div class="post-meta" style="margin-bottom: 16px;">
+      <span class="post-tag tag-linux">Linux</span>
+      <span class="post-date">2026-07-28</span>
+      <span class="post-read-time">· 10 min read</span>
+    </div>
+    <h1>Setting Up a Local RHEL 9 Repository Server — Complete Guide</h1>
+    <div class="post-tags-list" style="margin-top: 14px;">
+      <span class="post-tag-small">rhel</span>
+      <span class="post-tag-small">dnf</span>
+      <span class="post-tag-small">apache</span>
+      <span class="post-tag-small">selinux</span>
+    </div>
+  </div>
+
+  <div class="post-body">
+
+    <p>
+      In many organizations, each and every RHEL client machine hitting the Red Hat CDN
+      directly for updates is neither efficient nor good practice — internet bandwidth gets
+      consumed unnecessarily, and patching a large fleet takes much longer than it should.
+      The proper solution for this is to set up one local mirror server which syncs the
+      BaseOS and AppStream repositories once, and all the client machines pull updates from
+      that server over the LAN itself. This is much faster, and also gives better control
+      over what gets patched and when.
+    </p>
+    <p>
+      Below is the complete, tested procedure I follow for standing up such a local RHEL 9
+      repo server — from registering the mirror with Red Hat, right up to scheduling an
+      automatic weekly sync. Kindly note this needs an active Red Hat subscription attached
+      to the mirror server; without that, <code>subscription-manager</code> and
+      <code>dnf reposync</code> will not be able to pull anything from the CDN.
+    </p>
+
+    <h2>Sizing the mirror server</h2>
+    <p>
+      Before starting, it is good to know what resources are needed. The table below gives
+      the minimum and the recommended values I would suggest going with:
+    </p>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Resource</th><th style="text-align:left;">Minimum</th><th style="text-align:left;">Recommended</th></tr>
+      <tr><td>CPU</td><td>2 vCPUs</td><td>4 vCPUs</td></tr>
+      <tr><td>RAM</td><td>2 GB</td><td>4 GB</td></tr>
+      <tr><td>Disk</td><td>80 GB free</td><td>150 GB free</td></tr>
+      <tr><td>Network</td><td>100 Mbps</td><td>1 Gbps</td></tr>
+    </table>
+    <p>
+      With <code>--newest-only</code> (only the latest package versions, not every historic
+      version), BaseOS takes roughly 10–15 GB and AppStream another 15–20 GB — so around
+      25–35 GB total. Plan disk accordingly, keeping some headroom for future growth.
+    </p>
+
+    <h2>1. Register the mirror server with Red Hat</h2>
+    <p>
+      First step is registering the mirror server itself with the Red Hat Customer Portal,
+      so it gets access to the CDN:
+    </p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager register --username=&lt;rh-username&gt; --password=&lt;rh-password&gt;
+</pre>
+    <p>Attach an available subscription automatically:</p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager attach --auto
+</pre>
+    <p>Then verify that registration is proper:</p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager status
+</pre>
+    <p>You should be getting output like this, confirming everything is in order:</p>
+    <pre><span class="pre-label">output</span>
++-------------------------------------------+
+   System Status Details
++-------------------------------------------+
+Overall Status: Current
+</pre>
+
+    <h2>2. Install the required packages</h2>
+    <pre><span class="pre-label">bash</span>
+dnf install -y httpd createrepo_c dnf-utils policycoreutils-python-utils
+</pre>
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem;">
+      <tr><th style="text-align:left;">Package</th><th style="text-align:left;">Purpose</th></tr>
+      <tr><td><code>httpd</code></td><td>Apache HTTP server, to serve the repo files to clients</td></tr>
+      <tr><td><code>createrepo_c</code></td><td>Generates the RPM repository metadata</td></tr>
+      <tr><td><code>dnf-utils</code></td><td>Provides the <code>dnf reposync</code> command</td></tr>
+      <tr><td><code>policycoreutils-python-utils</code></td><td>Manages SELinux file contexts</td></tr>
+    </table>
+
+    <h2>3. Enable the RHEL 9 repositories</h2>
+    <p>First check which repositories are available for RHEL 9 on your subscription:</p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager repos --list | grep "rhel-9"
+</pre>
+    <p>Then enable the two we actually need — BaseOS and AppStream:</p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager repos \
+  --enable=rhel-9-for-x86_64-baseos-rpms \
+  --enable=rhel-9-for-x86_64-appstream-rpms
+</pre>
+    <p>Confirm they got enabled properly:</p>
+    <pre><span class="pre-label">bash</span>
+subscription-manager repos --list-enabled
+</pre>
+
+    <h2>4. Create the directory structure</h2>
+    <pre><span class="pre-label">bash</span>
+mkdir -p /var/repos/rhel9/baseos
+mkdir -p /var/repos/rhel9/appstream
+</pre>
+    <p>After the sync completes, the structure will look as below:</p>
+    <pre><span class="pre-label">tree</span>
+/var/repos/
+└── rhel9/
+    ├── baseos/
+    │   ├── Packages/
+    │   └── repodata/
+    └── appstream/
+        ├── Packages/
+        └── repodata/
+</pre>
+
+    <h2>5. Sync packages from the Red Hat CDN</h2>
+    <p>
+      This is the main step — pulling down the actual packages. <code>--newest-only</code>
+      keeps only the latest version of each package (much less disk usage), and
+      <code>--delete</code> removes any local packages that Red Hat has since retired from
+      the CDN, so the mirror doesn't drift out of sync over time.
+    </p>
+    <p><strong>Sync BaseOS:</strong></p>
+    <pre><span class="pre-label">bash</span>
+dnf reposync \
+  --repoid=rhel-9-for-x86_64-baseos-rpms \
+  --download-path=/var/repos/rhel9/baseos/ \
+  --newest-only \
+  --delete
+</pre>
+    <p><strong>Sync AppStream:</strong></p>
+    <pre><span class="pre-label">bash</span>
+dnf reposync \
+  --repoid=rhel-9-for-x86_64-appstream-rpms \
+  --download-path=/var/repos/rhel9/appstream/ \
+  --newest-only \
+  --delete
+</pre>
+    <div class="callout info">
+      <strong>Please note:</strong> the very first sync can easily take 30–90 minutes,
+      depending on your internet speed and how busy the Red Hat CDN is at that time. Do not
+      panic if it looks slow — just let it complete.
+    </div>
+
+    <h2>6. Generate the repository metadata</h2>
+    <p>
+      Once the packages are synced, we need to generate <code>repodata/</code> — this is
+      what the client machines actually read to resolve dependencies:
+    </p>
+    <pre><span class="pre-label">bash</span>
+createrepo_c /var/repos/rhel9/baseos/
+createrepo_c /var/repos/rhel9/appstream/
+</pre>
+    <p>For all the subsequent syncs, use <code>--update</code> instead — much faster, as it only regenerates the metadata that actually changed:</p>
+    <pre><span class="pre-label">bash</span>
+createrepo_c --update /var/repos/rhel9/baseos/
+createrepo_c --update /var/repos/rhel9/appstream/
+</pre>
+
+    <h2>7. Configure the Apache HTTP server</h2>
+    <p>Symlink the repo directory so Apache can serve it out:</p>
+    <pre><span class="pre-label">bash</span>
+ln -s /var/repos /var/www/html/repos
+</pre>
+    <p>Enable and start Apache:</p>
+    <pre><span class="pre-label">bash</span>
+systemctl enable --now httpd
+</pre>
+    <p>Check it is running fine:</p>
+    <pre><span class="pre-label">bash</span>
+systemctl status httpd
+</pre>
+    <p>And test locally that the repo is actually reachable:</p>
+    <pre><span class="pre-label">bash</span>
+curl -s http://localhost/repos/rhel9/baseos/repodata/repomd.xml | head -5
+</pre>
+    <p>Expected output should begin like this:</p>
+    <pre><span class="pre-label">xml</span>
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;repomd xmlns="http://linux.duke.edu/metadata/repo" ...&gt;
+</pre>
+
+    <h2>8. Configure SELinux and the firewall</h2>
+    <p>
+      This step is very important and often gets missed — even if Apache is running fine,
+      clients will get a <code>403 Forbidden</code> if SELinux context is not set correctly
+      on the repo directory.
+    </p>
+    <p><strong>SELinux:</strong></p>
+    <pre><span class="pre-label">bash</span>
+semanage fcontext -a -t httpd_sys_content_t "/var/repos(/.*)?"
+restorecon -Rv /var/repos
+</pre>
+    <p>Verify the context got applied:</p>
+    <pre><span class="pre-label">bash</span>
+ls -lZ /var/repos/
+</pre>
+    <p>It should be showing <code>httpd_sys_content_t</code> against the files.</p>
+    <p><strong>Firewall:</strong></p>
+    <pre><span class="pre-label">bash</span>
+firewall-cmd --permanent --add-service=http
+firewall-cmd --reload
+</pre>
+    <p>Confirm the rule got added properly:</p>
+    <pre><span class="pre-label">bash</span>
+firewall-cmd --list-services
+</pre>
+
+    <h2>9. Configure the client machines</h2>
+    <p>On each RHEL 9 client, create a new repo file:</p>
+    <pre><span class="pre-label">bash</span>
+vi /etc/yum.repos.d/local-rhel9.repo
+</pre>
+    <p>Paste in the following, replacing <code>&lt;mirror-server-ip&gt;</code> with the actual IP or hostname of your mirror server:</p>
+    <pre><span class="pre-label">ini</span>
+[local-rhel9-baseos]
+name=Local RHEL 9 BaseOS
+baseurl=http://&lt;mirror-server-ip&gt;/repos/rhel9/baseos/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+
+[local-rhel9-appstream]
+name=Local RHEL 9 AppStream
+baseurl=http://&lt;mirror-server-ip&gt;/repos/rhel9/appstream/
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+</pre>
+    <p>Clear the DNF cache and check that the repos show up:</p>
+    <pre><span class="pre-label">bash</span>
+dnf clean all
+dnf repolist
+</pre>
+    <p>You should be seeing:</p>
+    <pre><span class="pre-label">output</span>
+repo id                   repo name
+local-rhel9-baseos        Local RHEL 9 BaseOS
+local-rhel9-appstream     Local RHEL 9 AppStream
+</pre>
+    <p>Test an actual install from the local repo, purely to confirm end-to-end:</p>
+    <pre><span class="pre-label">bash</span>
+dnf install --disablerepo="*" --enablerepo="local-rhel9-*" vim -y
+</pre>
+
+    <h2>10. Automate the repository sync</h2>
+    <p>
+      Doing the sync manually every time is not sustainable — better to script it and put
+      it on cron. Create the script:
+    </p>
+    <pre><span class="pre-label">bash</span>
+vi /usr/local/bin/rhel9-repo-sync.sh
+</pre>
+    <pre><span class="pre-label">bash</span>
+#!/bin/bash
+
+LOG="/var/log/rhel9-repo-sync.log"
+REPOS=(
+  "rhel-9-for-x86_64-baseos-rpms:/var/repos/rhel9/baseos"
+  "rhel-9-for-x86_64-appstream-rpms:/var/repos/rhel9/appstream"
+)
+
+echo "========================================" >> "$LOG"
+echo "Sync started: $(date)" >> "$LOG"
+
+for ENTRY in "${REPOS[@]}"; do
+  REPOID="${ENTRY%%:*}"
+  PATH_DIR="${ENTRY##*:}"
+
+  echo "[INFO] Syncing $REPOID ..." >> "$LOG"
+  dnf reposync \
+    --repoid="$REPOID" \
+    --download-path="$PATH_DIR/" \
+    --newest-only \
+    --delete >> "$LOG" 2>&1
+
+  echo "[INFO] Updating metadata for $PATH_DIR ..." >> "$LOG"
+  createrepo_c --update "$PATH_DIR/" >> "$LOG" 2>&1
+done
+
+echo "Sync completed: $(date)" >> "$LOG"
+</pre>
+    <p>Make it executable:</p>
+    <pre><span class="pre-label">bash</span>
+chmod +x /usr/local/bin/rhel9-repo-sync.sh
+</pre>
+    <p>Schedule it for every Sunday, 2:00 AM — a quiet time when clients are least likely to be pulling updates:</p>
+    <pre><span class="pre-label">bash</span>
+vi /etc/cron.d/rhel9-repo-sync
+</pre>
+    <pre><span class="pre-label">cron</span>
+0 2 * * 0  root  /usr/local/bin/rhel9-repo-sync.sh
+</pre>
+    <p>Verify the cron job got registered:</p>
+    <pre><span class="pre-label">bash</span>
+crontab -l -u root
+</pre>
+    <p>And after the first scheduled run, check the log to confirm it actually worked:</p>
+    <pre><span class="pre-label">bash</span>
+tail -f /var/log/rhel9-repo-sync.log
+</pre>
+
+    <h2>11. Verification and troubleshooting</h2>
+    <p>A few commands that are useful to check the health of the mirror server:</p>
+    <div style="overflow-x: auto;">
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem; border-collapse: collapse;">
+      <tr><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Check</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Command</th></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Apache is serving the repo</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>curl http://localhost/repos/rhel9/baseos/repodata/repomd.xml</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Disk usage of repos</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>du -sh /var/repos/rhel9/*</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">SELinux denials, if access fails</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>ausearch -m avc -ts recent</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Apache error log</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>tail -50 /var/log/httpd/error_log</code></td></tr>
+      <tr><td style="padding:8px;">Sync log</td><td style="padding:8px;"><code>tail -100 /var/log/rhel9-repo-sync.log</code></td></tr>
+    </table>
+    </div>
+    <p>And on the client side, if something is not working as expected:</p>
+    <div style="overflow-x: auto;">
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem; border-collapse: collapse;">
+      <tr><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Check</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Command</th></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">List configured repos</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>dnf repolist</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Test connectivity to the mirror</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>curl http://&lt;mirror-server-ip&gt;/repos/rhel9/baseos/repodata/repomd.xml</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Check the repo cache</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>dnf makecache</code></td></tr>
+      <tr><td style="padding:8px;">Search a package from the local repo</td><td style="padding:8px;"><code>dnf search --disablerepo="*" --enablerepo="local-rhel9-*" vim</code></td></tr>
+    </table>
+    </div>
+
+    <h3>Common issues</h3>
+    <div style="overflow-x: auto;">
+    <table style="width:100%; margin: 20px 0; font-size: 0.85rem; border-collapse: collapse;">
+      <tr><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Symptom</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Likely cause</th><th style="text-align:left; padding:8px; border-bottom:1px solid var(--border-dim);">Fix</th></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>403 Forbidden</code> from Apache</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">SELinux context is incorrect</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Re-run <code>restorecon -Rv /var/repos</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>repomd.xml not found</code></td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>createrepo_c</code> not run yet</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Run <code>createrepo_c</code> on the directory</td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>No packages available</code></td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Repo not enabled on the mirror</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>subscription-manager repos --list-enabled</code></td></tr>
+      <tr><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Client cannot reach the mirror</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);">Firewall blocking port 80</td><td style="padding:8px; border-bottom:1px solid var(--border-dim);"><code>firewall-cmd --permanent --add-service=http</code></td></tr>
+      <tr><td style="padding:8px;">GPG check fails on the client</td><td style="padding:8px;">GPG key missing on the client</td><td style="padding:8px;">Copy <code>/etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release</code> from the mirror</td></tr>
+    </table>
+    </div>
+
+    <div class="callout success">
+      <strong>Setup checklist:</strong> mirror registered and subscription attached, packages
+      installed (<code>httpd</code>, <code>createrepo_c</code>, <code>dnf-utils</code>),
+      BaseOS/AppStream repos enabled, directories created under
+      <code>/var/repos/rhel9/</code>, <code>dnf reposync</code> and <code>createrepo_c</code>
+      completed for both, Apache symlink and service started, SELinux context applied,
+      firewall opened for HTTP, client <code>.repo</code> file in place and
+      <code>dnf repolist</code> confirmed, and the cron sync job scheduled.
+    </div>
+
+    <p>
+      That completes the setup. Once this is in place, patching a large fleet of RHEL 9
+      machines becomes much quicker and much lighter on your internet line — every client
+      pulls from the LAN mirror instead of going out to the CDN individually, and the weekly
+      cron job keeps the mirror current without any manual intervention needed.
+    </p>
+
+    <p style="margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--border-dim); font-size: 0.85rem; color: var(--text-dim);">
+      Questions or suggestions on this setup? Write to
+      <a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a>.
+    </p>
+
+  </div>
+</div>
+
+<div style="height: 80px;"></div>
+
+<footer>
+  <div class="container footer-inner">
+    <span>© 2026 Siranjeevi Vasudevan</span>
+    <a href="../index.html">← Back to all posts</a>
+    <span><a href="mailto:vsiranjeevi93@gmail.com">vsiranjeevi93@gmail.com</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
