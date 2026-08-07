@@ -201,7 +201,7 @@ img { max-width: 100%; display: block; }
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 0.9rem;
-  padding: 12px 16px 12px 40px;
+  padding: 12px 16px 12px 96px;
   outline: none;
   transition: border-color .2s;
 }
