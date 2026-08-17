@@ -57,7 +57,7 @@ if (typingEl) {
   const messages = [
     'grep -r "solution" ./incidents/',
     'ansible-playbook fix-infra.yml',
-    'kubectl get pods --all-namespaces',
+    'systemctl status httpd --no-pager',
     'fortigate> show firewall policy',
     'aws ec2 describe-instances --region ap-south-1',
   ];
